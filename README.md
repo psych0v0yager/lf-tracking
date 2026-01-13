@@ -34,7 +34,7 @@ uv run python scripts/export_onnx.py
 # Install cuDNN for GPU acceleration:
 uv add nvidia-cudnn-cu12
 # Set library path and run:
-export LD_LIBRARY_PATH=$(python -c "import nvidia.cudnn; print(nvidia.cudnn.__file__.replace('__init__.py', 'lib'))"):$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$(uv run python -c "import nvidia.cudnn as c; import os; print(os.path.join(os.path.dirname(c.__path__[0]), 'cudnn', 'lib'))"):$LD_LIBRARY_PATH
 uv run python tracker_mixformer_onnx.py test_track_dron1.mp4 1314 623 73 46
 
 # Production mode (no display/output for max speed)
