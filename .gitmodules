@@ -1,0 +1,6 @@
+[submodule "MixFormerV2"]
+	path = MixFormerV2
+	url = https://github.com/MCG-NJU/MixFormerV2.git
+[submodule "MixformerV2-onnx"]
+	path = MixformerV2-onnx
+	url = https://github.com/maliangzhibi/MixformerV2-onnx.git
