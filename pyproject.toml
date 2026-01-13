@@ -1,16 +1,12 @@
 [project]
 name = "lf-tracking"
 version = "0.1.0"
-description = "Add your description here"
+description = "Real-time drone tracking with MixFormerV2 and CSRT"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "easydict>=1.13",
     "einops>=0.8.1",
-    "gdown>=5.2.1",
     "opencv-contrib-python>=4.12.0.88",
-    "opencv-python>=4.12.0.88",
-    "tensorboardx>=2.6.4",
     "timm>=1.0.24",
-    "ultralytics>=8.3.252",
 ]
