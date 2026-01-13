@@ -1,0 +1,698 @@
+"""
+Robust Single Object Tracker - Version 16
+
+YOLO-assisted recovery:
+- Uses v12 approach (motion comp + verification) as base
+- When tracking fails, triggers YOLO detection on cropped search region
+- YOLO runs periodically (not every frame) to save compute
+- Uses YOLO detections as candidates, verifies against template
+
+Usage:
+    python best_tracker_v16.py test_track_dron1.mp4 1314 623 73 46
+"""
+
+import cv2
+import numpy as np
+import sys
+from pathlib import Path
+import argparse
+import threading
+import queue
+import time
+
+
+def create_tracker():
+    return cv2.TrackerCSRT_create(), "CSRT"
+
+
+class CameraMotionEstimator:
+    def __init__(self):
+        self.prev_gray = None
+        self.lk_params = dict(
+            winSize=(21, 21),
+            maxLevel=4,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+        )
+        self.feature_params = dict(
+            maxCorners=300,
+            qualityLevel=0.01,
+            minDistance=20,
+            blockSize=7
+        )
+
+    def update(self, gray, bbox):
+        if self.prev_gray is None:
+            self.prev_gray = gray.copy()
+            return None, 0
+
+        h, w = gray.shape
+        mask = np.ones((h, w), dtype=np.uint8) * 255
+        x, y, bw, bh = [int(v) for v in bbox]
+        margin = max(30, bw, bh)
+        x1, y1 = max(0, x - margin), max(0, y - margin)
+        x2, y2 = min(w, x + bw + margin), min(h, y + bh + margin)
+        mask[y1:y2, x1:x2] = 0
+
+        prev_pts = cv2.goodFeaturesToTrack(self.prev_gray, mask=mask, **self.feature_params)
+
+        if prev_pts is None or len(prev_pts) < 8:
+            self.prev_gray = gray.copy()
+            return None, 0
+
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.prev_gray, gray, prev_pts, None, **self.lk_params
+        )
+
+        if curr_pts is None:
+            self.prev_gray = gray.copy()
+            return None, 0
+
+        good_prev = prev_pts[status.flatten() == 1]
+        good_curr = curr_pts[status.flatten() == 1]
+
+        if len(good_prev) < 8:
+            self.prev_gray = gray.copy()
+            return None, 0
+
+        H, inliers = cv2.findHomography(good_prev, good_curr, cv2.RANSAC, 5.0)
+
+        motion = 0
+        if inliers is not None:
+            inlier_mask = inliers.flatten() == 1
+            if inlier_mask.sum() > 0:
+                motion = np.median(np.linalg.norm(
+                    good_curr[inlier_mask] - good_prev[inlier_mask], axis=1
+                ))
+
+        self.prev_gray = gray.copy()
+        return H, motion
+
+
+def transform_bbox(bbox, H, frame_shape):
+    x, y, w, h = bbox
+    corners = np.array([
+        [x, y], [x+w, y], [x+w, y+h], [x, y+h]
+    ], dtype=np.float32).reshape(-1, 1, 2)
+    transformed = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+    x_new = transformed[:, 0].min()
+    y_new = transformed[:, 1].min()
+    w_new = transformed[:, 0].max() - x_new
+    h_new = transformed[:, 1].max() - y_new
+    fh, fw = frame_shape[:2]
+    x_new = max(0, min(x_new, fw - w_new - 1))
+    y_new = max(0, min(y_new, fh - h_new - 1))
+    return (int(x_new), int(y_new), int(w_new), int(h_new))
+
+
+def clamp_bbox(bbox, frame_shape):
+    x, y, w, h = bbox
+    fh, fw = frame_shape[:2]
+    x = max(0, min(int(x), fw - int(w) - 1))
+    y = max(0, min(int(y), fh - int(h) - 1))
+    return (x, y, int(w), int(h))
+
+
+class TemplateVerifier:
+    def __init__(self):
+        self.reference_template = None
+        self.original_template = None  # Keep original for fallback
+        self.template_size = None
+        self.update_alpha = 0.05  # Slow template adaptation
+
+    def set_reference(self, gray, bbox, save_path="debug_template.png"):
+        x, y, w, h = [int(v) for v in bbox]
+        fh, fw = gray.shape
+        x, y = max(0, x), max(0, y)
+        w, h = min(w, fw - x), min(h, fh - y)
+        if w > 0 and h > 0:
+            self.reference_template = gray[y:y+h, x:x+w].copy()
+            self.original_template = self.reference_template.copy()
+            self.template_size = (w, h)
+            # Save template for debugging
+            if save_path:
+                cv2.imwrite(save_path, self.reference_template)
+                print(f"Template saved to: {save_path} (size: {w}x{h})")
+
+    def update_template(self, gray, bbox, alpha=None):
+        """Slowly adapt template when tracking is confident"""
+        if self.reference_template is None:
+            return
+        if alpha is None:
+            alpha = self.update_alpha
+
+        x, y, w, h = [int(v) for v in bbox]
+        fh, fw = gray.shape
+        x, y = max(0, x), max(0, y)
+        w, h = min(w, fw - x), min(h, fh - y)
+
+        if w <= 0 or h <= 0:
+            return
+
+        current = gray[y:y+h, x:x+w]
+        if current.shape != self.reference_template.shape:
+            try:
+                current = cv2.resize(current, (self.template_size[0], self.template_size[1]))
+            except:
+                return
+
+        # Blend current appearance into template
+        self.reference_template = cv2.addWeighted(
+            self.reference_template, 1 - alpha,
+            current, alpha, 0
+        )
+
+    def verify(self, gray, bbox, threshold=0.3, frame_num=0, save_debug=False):
+        if self.reference_template is None:
+            return True, 1.0
+        x, y, w, h = [int(v) for v in bbox]
+        fh, fw = gray.shape
+        x, y = max(0, x), max(0, y)
+        w, h = min(w, fw - x), min(h, fh - y)
+        if w <= 0 or h <= 0:
+            return False, 0.0
+        current = gray[y:y+h, x:x+w]
+        if current.size == 0:
+            return False, 0.0
+        if current.shape != self.reference_template.shape:
+            try:
+                current = cv2.resize(current, (self.template_size[0], self.template_size[1]))
+            except:
+                return False, 0.0
+        try:
+            result = cv2.matchTemplate(current, self.reference_template, cv2.TM_CCOEFF_NORMED)
+            score = result[0, 0] if result.size > 0 else 0.0
+        except:
+            score = 0.0
+
+        # Save debug images around failure point
+        if save_debug and 610 <= frame_num <= 640:
+            debug_dir = Path("debug_verify")
+            debug_dir.mkdir(exist_ok=True)
+            cv2.imwrite(str(debug_dir / f"frame_{frame_num:04d}_current_score{score:.2f}.png"), current)
+
+        return score >= threshold, score
+
+    def verify_bbox(self, gray, bbox):
+        """Verify a bbox and return score (no threshold)"""
+        _, score = self.verify(gray, bbox, threshold=0.0)
+        return score
+
+    def _search_with_template(self, gray, search_region, template, threshold):
+        """Search using a specific template"""
+        if template is None:
+            return None
+        sx, sy, sw, sh = [int(v) for v in search_region]
+        fh, fw = gray.shape
+        sx, sy = max(0, sx), max(0, sy)
+        sw, sh = min(sw, fw - sx), min(sh, fh - sy)
+        th, tw = template.shape[:2]
+        if sw <= tw or sh <= th:
+            return None
+        region = gray[sy:sy+sh, sx:sx+sw]
+        best_val = 0
+        best_loc = None
+        best_scale = 1.0
+        for scale in [0.8, 0.9, 1.0, 1.1, 1.2]:
+            new_h, new_w = int(th * scale), int(tw * scale)
+            if new_h >= region.shape[0] or new_w >= region.shape[1]:
+                continue
+            if new_h < 5 or new_w < 5:
+                continue
+            try:
+                scaled = cv2.resize(template, (new_w, new_h))
+                result = cv2.matchTemplate(region, scaled, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(result)
+                if max_val > best_val:
+                    best_val = max_val
+                    best_loc = max_loc
+                    best_scale = scale
+            except:
+                continue
+        if best_val >= threshold and best_loc is not None:
+            x = sx + best_loc[0]
+            y = sy + best_loc[1]
+            w = int(tw * best_scale)
+            h = int(th * best_scale)
+            return (x, y, w, h, best_val)
+        return None
+
+    def search(self, gray, search_region, threshold=0.25):
+        """Search using both adapted and original templates, return best"""
+        # Try adapted template
+        match1 = self._search_with_template(gray, search_region, self.reference_template, threshold)
+
+        # Try original template
+        match2 = self._search_with_template(gray, search_region, self.original_template, threshold)
+
+        # Return best match
+        if match1 is None and match2 is None:
+            return None
+        if match1 is None:
+            return match2
+        if match2 is None:
+            return match1
+        return match1 if match1[4] >= match2[4] else match2
+
+
+class YOLODetector:
+    """
+    YOLO-based object detector for recovery.
+    Runs on cropped regions, not full frame.
+    """
+
+    def __init__(self, model_name="yolo11n.pt", conf_threshold=0.3):
+        self.model = None
+        self.model_name = model_name
+        self.conf_threshold = conf_threshold
+        self.last_request_time = 0
+        self.cooldown = 0.1  # 100ms between requests
+        self._load_model()
+
+    def _load_model(self):
+        try:
+            from ultralytics import YOLO
+            self.model = YOLO(self.model_name)
+            print(f"YOLO model loaded: {self.model_name}")
+        except Exception as e:
+            print(f"Failed to load YOLO: {e}")
+            self.model = None
+
+    def detect_in_region(self, frame, search_region, target_size):
+        """
+        Run YOLO on a cropped region and return candidates.
+
+        Args:
+            frame: Full BGR frame
+            search_region: (x, y, w, h) region to search
+            target_size: (w, h) expected object size
+
+        Returns:
+            List of (x, y, w, h, confidence) in full frame coordinates
+        """
+        if self.model is None:
+            return []
+
+        # Rate limiting
+        now = time.time()
+        if now - self.last_request_time < self.cooldown:
+            return []
+        self.last_request_time = now
+
+        sx, sy, sw, sh = [int(v) for v in search_region]
+        fh, fw = frame.shape[:2]
+        sx, sy = max(0, sx), max(0, sy)
+        sw, sh = min(sw, fw - sx), min(sh, fh - sy)
+
+        if sw < 50 or sh < 50:
+            return []
+
+        # Crop region
+        crop = frame[sy:sy+sh, sx:sx+sw]
+
+        try:
+            # Run YOLO with low confidence to get more candidates
+            results = self.model(crop, conf=self.conf_threshold, verbose=False)
+
+            candidates = []
+            target_w, target_h = target_size
+            target_area = target_w * target_h
+
+            # Debug: show what YOLO found
+            total_detections = sum(len(r.boxes) if r.boxes is not None else 0 for r in results)
+            if total_detections > 0:
+                print(f"YOLO found {total_detections} detections in region")
+
+            for r in results:
+                if r.boxes is None:
+                    continue
+
+                for box in r.boxes:
+                    # Get bbox in crop coordinates
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    conf = float(box.conf[0])
+
+                    w = x2 - x1
+                    h = y2 - y1
+                    area = w * h
+
+                    # Filter by size (0.3x to 5x target area)
+                    if area < target_area * 0.3 or area > target_area * 5:
+                        continue
+
+                    # Convert to full frame coordinates
+                    fx = sx + x1
+                    fy = sy + y1
+
+                    candidates.append((int(fx), int(fy), int(w), int(h), conf))
+
+            return candidates
+
+        except Exception as e:
+            print(f"YOLO error: {e}")
+            return []
+
+
+class RobustTrackerV16:
+    def __init__(self, motion_threshold=20, verify_threshold=0.5, use_yolo=True):
+        self.motion_threshold = motion_threshold
+        self.verify_threshold = verify_threshold
+        self.use_yolo = use_yolo
+
+        self.tracker = None
+        self.tracker_name = None
+        self.camera_motion = CameraMotionEstimator()
+        self.verifier = TemplateVerifier()
+        self.yolo = YOLODetector() if use_yolo else None
+
+        self.bbox = None
+        self.original_size = None
+        self.lost_count = 0
+        self.frame_count = 0
+        self.recovery_method = None
+        self.verify_score = 1.0
+
+        self.last_good_bbox = None
+        self.yolo_cooldown = 0  # Frames to wait before next YOLO
+
+        # Score history for drop detection
+        self.score_history = []
+        self.score_history_len = 5
+
+    def initialize(self, frame, bbox):
+        self.bbox = tuple(int(v) for v in bbox)
+        self.original_size = (self.bbox[2], self.bbox[3])
+        self.last_good_bbox = self.bbox
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self.camera_motion.update(gray, self.bbox)
+        self.verifier.set_reference(gray, self.bbox)
+
+        self.tracker, self.tracker_name = create_tracker()
+
+        try:
+            self.tracker.init(frame, self.bbox)
+            return True
+        except Exception as e:
+            print(f"Tracker init failed: {e}")
+            return False
+
+    def _try_yolo_recovery(self, frame, gray, search_center):
+        """Try to recover using YOLO detection"""
+        if self.yolo is None or self.yolo_cooldown > 0:
+            return None
+
+        orig_w, orig_h = self.original_size
+        fh, fw = frame.shape[:2]
+
+        # Create search region around predicted position - search wide!
+        expand = 10.0 + self.lost_count * 1.0
+        search_w = orig_w * expand
+        search_h = orig_h * expand
+
+        search_region = (
+            int(max(0, search_center[0] - search_w / 2)),
+            int(max(0, search_center[1] - search_h / 2)),
+            int(min(search_w, fw)),
+            int(min(search_h, fh))
+        )
+
+        # Run YOLO
+        candidates = self.yolo.detect_in_region(frame, search_region, self.original_size)
+
+        if not candidates:
+            self.yolo_cooldown = 2  # Wait 2 frames before trying again
+            return None
+
+        # Verify each candidate against template, pick best
+        best_match = None
+        best_score = 0
+
+        for cx, cy, cw, ch, conf in candidates:
+            # Create bbox with original size centered on detection
+            det_cx = cx + cw / 2
+            det_cy = cy + ch / 2
+            test_bbox = (int(det_cx - orig_w/2), int(det_cy - orig_h/2), orig_w, orig_h)
+            test_bbox = clamp_bbox(test_bbox, frame.shape)
+
+            score = self.verifier.verify_bbox(gray, test_bbox)
+
+            # Combine YOLO confidence and template score
+            combined_score = 0.3 * conf + 0.7 * score
+
+            if combined_score > best_score:
+                best_score = combined_score
+                best_match = (test_bbox, score, conf)
+
+        if best_match and best_match[1] > 0.15:  # Template score threshold
+            self.yolo_cooldown = 1  # Short cooldown on success
+            return best_match
+
+        self.yolo_cooldown = 2  # Short cooldown - keep trying
+        return None
+
+    def update(self, frame):
+        self.frame_count += 1
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        fh, fw = frame.shape[:2]
+        self.recovery_method = None
+
+        if self.yolo_cooldown > 0:
+            self.yolo_cooldown -= 1
+
+        # Camera motion
+        H, cam_motion = self.camera_motion.update(gray, self.bbox)
+
+        # Motion-compensated prediction
+        if H is not None:
+            try:
+                motion_pred = transform_bbox(self.bbox, H, frame.shape)
+            except:
+                motion_pred = self.bbox
+        else:
+            motion_pred = self.bbox
+
+        # Reinitialize on high camera motion
+        if cam_motion > self.motion_threshold:
+            self.tracker, _ = create_tracker()
+            self.tracker.init(frame, motion_pred)
+
+        # Run primary tracker
+        try:
+            tracker_success, box = self.tracker.update(frame)
+        except:
+            tracker_success = False
+            box = self.bbox
+
+        # Verify
+        actual_success = False
+        if tracker_success:
+            temp_bbox = tuple(int(v) for v in box)
+            is_valid, self.verify_score = self.verifier.verify(
+                gray, temp_bbox, self.verify_threshold,
+                frame_num=self.frame_count, save_debug=True
+            )
+
+            # Also check for sudden score drop (indicates drift to wrong target)
+            if len(self.score_history) >= 3:
+                recent_avg = np.mean(self.score_history[-3:])
+                # If score drops more than 0.25 from recent average, reject
+                if self.verify_score < recent_avg - 0.25:
+                    is_valid = False
+                    print(f"Frame {self.frame_count}: Score drop detected {recent_avg:.2f} -> {self.verify_score:.2f}")
+
+            if is_valid:
+                x, y, w, h = temp_bbox
+                orig_w, orig_h = self.original_size
+                w = max(int(orig_w * 0.7), min(int(orig_w * 1.3), w))
+                h = max(int(orig_h * 0.7), min(int(orig_h * 1.3), h))
+                cx, cy = x + box[2]/2, y + box[3]/2
+                self.bbox = clamp_bbox((cx - w/2, cy - h/2, w, h), frame.shape)
+
+                self.lost_count = 0
+                self.last_good_bbox = self.bbox
+                actual_success = True
+
+                # Adapt template when tracking is very confident
+                if self.verify_score > 0.65:
+                    self.verifier.update_template(gray, self.bbox, alpha=0.03)
+                    # Save adapted template periodically for debugging
+                    if self.frame_count % 100 == 0:
+                        cv2.imwrite(f"debug_template_frame{self.frame_count}.png",
+                                    self.verifier.reference_template)
+
+                # Track score history for good frames only
+                self.score_history.append(self.verify_score)
+                if len(self.score_history) > self.score_history_len:
+                    self.score_history.pop(0)
+        else:
+            self.verify_score = 0.0
+
+        # Recovery
+        if not actual_success:
+            self.lost_count += 1
+            orig_w, orig_h = self.original_size
+
+            # IMMEDIATE full-frame search with HIGH threshold
+            # This avoids false matches on clouds/bushes
+            match = self.verifier.search(gray, (0, 0, fw, fh), threshold=0.55)
+
+            if match:
+                mx, my, mw, mh, score = match
+                self.bbox = clamp_bbox((mx, my, orig_w, orig_h), frame.shape)
+                self.verify_score = score
+
+                self.tracker, _ = create_tracker()
+                self.tracker.init(frame, self.bbox)
+
+                self.recovery_method = f"fullsearch({score:.2f})"
+                self.last_good_bbox = self.bbox
+                self.score_history = [score]
+                actual_success = True
+                print(f"Frame {self.frame_count}: Full search recovered at ({mx}, {my}) score={score:.2f}")
+
+            # If high-threshold search fails, try lower threshold but verify result
+            if not actual_success:
+                match = self.verifier.search(gray, (0, 0, fw, fh), threshold=0.35)
+
+                if match:
+                    mx, my, mw, mh, score = match
+                    # Only accept if score is reasonably good
+                    if score > 0.45:
+                        self.bbox = clamp_bbox((mx, my, orig_w, orig_h), frame.shape)
+                        self.verify_score = score
+
+                        self.tracker, _ = create_tracker()
+                        self.tracker.init(frame, self.bbox)
+
+                        self.recovery_method = f"search({score:.2f})"
+                        self.last_good_bbox = self.bbox
+                        self.score_history = [score]
+                        actual_success = True
+                        print(f"Frame {self.frame_count}: Search recovered at ({mx}, {my}) score={score:.2f}")
+
+            # Hold position as last resort - but first check what the best match was
+            if not actual_success:
+                # Debug: what's the best match score even if below threshold?
+                debug_match = self.verifier.search(gray, (0, 0, fw, fh), threshold=0.0)
+                if debug_match:
+                    print(f"Frame {self.frame_count}: Best match score was {debug_match[4]:.2f} at ({debug_match[0]}, {debug_match[1]})")
+
+                self.bbox = self.last_good_bbox if self.last_good_bbox else motion_pred
+                self.tracker, _ = create_tracker()
+                self.tracker.init(frame, self.bbox)
+                self.recovery_method = "hold"
+                print(f"Frame {self.frame_count}: Holding position, lost_count={self.lost_count}")
+
+        return actual_success, self.bbox, cam_motion, self.verify_score
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Robust Object Tracker V16 with YOLO")
+    parser.add_argument("video", help="Video file path")
+    parser.add_argument("x", type=int, help="Initial bbox x")
+    parser.add_argument("y", type=int, help="Initial bbox y")
+    parser.add_argument("w", type=int, help="Initial bbox width")
+    parser.add_argument("h", type=int, help="Initial bbox height")
+    parser.add_argument("--no-yolo", action="store_true", help="Disable YOLO recovery")
+    parser.add_argument("--verify-threshold", type=float, default=0.25)
+    parser.add_argument("--output", "-o", help="Output video path")
+
+    args = parser.parse_args()
+    bbox = (args.x, args.y, args.w, args.h)
+
+    print(f"OpenCV version: {cv2.__version__}")
+    print(f"Video: {args.video}")
+    print(f"Initial bbox: {bbox}")
+
+    cap = cv2.VideoCapture(args.video)
+    if not cap.isOpened():
+        print(f"Error: Cannot open '{args.video}'")
+        sys.exit(1)
+
+    ret, frame = cap.read()
+    if not ret:
+        print("Error: Cannot read first frame")
+        sys.exit(1)
+
+    fh, fw = frame.shape[:2]
+
+    tracker = RobustTrackerV16(
+        verify_threshold=args.verify_threshold,
+        use_yolo=not args.no_yolo
+    )
+    if not tracker.initialize(frame, bbox):
+        print("Error: Failed to initialize tracker")
+        sys.exit(1)
+
+    print(f"\nTracker: {tracker.tracker_name}")
+    print(f"YOLO recovery: {'enabled' if tracker.use_yolo else 'disabled'}")
+    print("\nPress 'q' to quit, SPACE to pause\n")
+
+    out_path = args.output or (Path(args.video).stem + "_tracked_v16.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    writer = cv2.VideoWriter(out_path, fourcc, fps, (fw, fh))
+
+    frame_num = 0
+    success_count = 0
+    yolo_recoveries = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_num += 1
+        success, bbox, cam_motion, verify_score = tracker.update(frame)
+
+        if success:
+            success_count += 1
+        if tracker.recovery_method and "YOLO" in tracker.recovery_method:
+            yolo_recoveries += 1
+
+        x, y, w, h = bbox
+
+        if tracker.recovery_method and "YOLO" in tracker.recovery_method:
+            color = (255, 0, 255)  # Magenta for YOLO recovery
+        elif tracker.recovery_method:
+            color = (0, 255, 255)  # Yellow for template recovery
+        elif verify_score > 0.4:
+            color = (0, 255, 0)
+        elif verify_score > 0.25:
+            color = (0, 200, 200)
+        else:
+            color = (0, 165, 255)
+
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+        cv2.circle(frame, (x + w//2, y + h//2), 4, color, -1)
+
+        status = "TRACKING" if success and not tracker.recovery_method else f"LOST({tracker.lost_count})"
+        if tracker.recovery_method:
+            status = f"RECOVERED: {tracker.recovery_method}"
+
+        cv2.putText(frame, f"Frame {frame_num} | {status}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, f"Motion: {cam_motion:.1f} | Verify: {verify_score:.2f}",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+        writer.write(frame)
+        cv2.imshow("Tracking V16", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord(' '):
+            cv2.waitKey(0)
+
+    cap.release()
+    writer.release()
+    cv2.destroyAllWindows()
+
+    print(f"\n{'='*50}")
+    print(f"Results: {success_count}/{frame_num} frames ({100*success_count/frame_num:.1f}%)")
+    print(f"YOLO recoveries: {yolo_recoveries}")
+    print(f"Output: {out_path}")
+
+
+if __name__ == "__main__":
+    main()

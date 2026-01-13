@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# Debug artifacts
+debug_frames/
+debug_verify/
+debug_template*.png
+
+# Videos (input may be proprietary, outputs are generated)
+test_track_dron1.mp4
+outputs/
+
+# Large model files (download separately)
+# Keep: models/mixformerv2/models/mixformerv2_small_clean.pth
+*.pth.tar
+yolo*.pt
+nanotrack*.onnx
+vittrack*.onnx
