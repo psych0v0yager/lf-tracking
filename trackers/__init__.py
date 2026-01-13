@@ -1,4 +1,4 @@
-from .ekf_tracker import ExtendedKalmanTracker
-from .phase_detector import PhaseDetector, TrackingPhase
+from .mixformer_pytorch import MixFormerTracker
+from .mixformer_onnx import MixFormerONNXTracker
 
-__all__ = ['ExtendedKalmanTracker', 'PhaseDetector', 'TrackingPhase']
+__all__ = ['MixFormerTracker', 'MixFormerONNXTracker']
