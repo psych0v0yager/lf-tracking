@@ -17,6 +17,7 @@ debug_template*.png
 # Videos (input may be proprietary, outputs are generated)
 test_track_dron1.mp4
 outputs/
+archive/old_outputs/
 
 # Large model files (download separately)
 # Keep: models/mixformerv2/models/mixformerv2_small_clean.pth
