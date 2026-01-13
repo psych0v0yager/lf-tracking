@@ -12,6 +12,10 @@ Real-time single-object tracking for a tiny drone (~73x46 pixels) in video foota
 ## Quick Start
 
 ```bash
+# Clone with submodules
+git clone --recursive https://github.com/psych0v0yager/lf-tracking.git
+cd lf-tracking
+
 # Install dependencies
 uv sync
 
