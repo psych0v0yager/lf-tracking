@@ -10,7 +10,11 @@ dependencies = [
     "gdown>=5.2.1",
     "opencv-contrib-python>=4.12.0.88",
     "opencv-python>=4.12.0.88",
+    "onnx>=1.15.0",
+    "onnxruntime-gpu>=1.17.0",
     "tensorboardx>=2.6.4",
     "timm>=1.0.24",
     "ultralytics>=8.3.252",
+    "onnxscript>=0.5.7",
+    "nvidia-cudnn-cu12>=9.10.2.21",
 ]
