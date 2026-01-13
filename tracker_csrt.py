@@ -74,13 +74,7 @@ class TimingStats:
 
 def create_tracker():
     """Create CSRT tracker with balanced speed/accuracy parameters"""
-    # Handle both old and new OpenCV API (CSRT moved to cv2.legacy in OpenCV 4.5.1+)
-    try:
-        params = cv2.TrackerCSRT_Params()
-        create_fn = cv2.TrackerCSRT_create
-    except AttributeError:
-        params = cv2.legacy.TrackerCSRT_Params()
-        create_fn = cv2.legacy.TrackerCSRT_create
+    params = cv2.TrackerCSRT_Params()
 
     # Keep segmentation for accuracy (needed for end-of-video)
     params.use_segmentation = True       # Restored - needed for robustness
@@ -92,7 +86,7 @@ def create_tracker():
     params.admm_iterations = 3           # Default 4, fewer filter iterations
     params.histogram_bins = 8            # Default 16, coarser color histogram
 
-    return create_fn(params), "CSRT-balanced"
+    return cv2.TrackerCSRT_create(params), "CSRT-balanced"
 
 
 class CameraMotionEstimator:
